@@ -11,14 +11,15 @@ unit Horse.Session.CrossSocket;
 //
 //    uses
 //      Horse,
-//      Horse.Session,
+//      Horse.Session.Middleware,
 //      Horse.Session.MTLS,
 //      Horse.Session.CrossSocket;  // <-- activates the extension
 //
 //  How it works:
-//    - At request setup time, the CrossSocket adapter registers an
-//      IHorseTLSPeerCert accessor on Req.Services that reads the verified
-//      peer certificate from TCrossConnection's underlying TSslContext.
+//    - At request setup time, the CrossSocket adapter publishes an
+//      IHorseTLSPeerCert accessor on the request (PublishPeerCert) that
+//      reads the verified peer certificate from TCrossConnection's
+//      underlying TSslContext.
 //    - The TMTLSResolver in Horse.Session.MTLS finds the extension, reads
 //      the subject fields, and produces a TPrincipal.
 //
@@ -26,10 +27,10 @@ unit Horse.Session.CrossSocket;
 //  All implement IHorseTLSPeerCert against their respective TLS surfaces;
 //  horse-session itself only ships the contract and the CrossSocket adapter.
 //
-//  SCAFFOLD NOTE: the actual hook into CrossSocket's request bridge is a TODO
-//  until the provider surfaces the peer-cert slot. The contract and the
-//  wiring shape are in place; filling in ConnectHook against
-//  horse-provider-crosssocket is the only remaining work.
+//  NOT FUNCTIONAL YET: the hook into CrossSocket's request bridge does not
+//  exist. RegisterCrossSocketPeerCertAdapter is a no-op, so adding this unit
+//  changes nothing and TMTLSResolver never sees a certificate on CrossSocket.
+//  What is here is the adapter class the future hook will instantiate.
 // =============================================================================
 
 interface
@@ -45,8 +46,8 @@ uses
   Horse.Session.MTLS;
 
 type
-  /// Concrete adapter. Instantiated once per request by the provider hook;
-  /// kept alive via interface-reference by Req.Services.
+  /// Concrete adapter. Instantiated once per request by the provider hook
+  /// and handed to PublishPeerCert, which keeps it alive for the request.
   TCrossSocketPeerCertAdapter = class(TInterfacedObject, IHorseTLSPeerCert)
   strict private
     FIsVerified: Boolean;
@@ -68,8 +69,8 @@ type
   end;
 
 /// Called once at application startup. Hooks into horse-provider-crosssocket
-/// so every request carrying a verified peer certificate publishes a
-/// TCrossSocketPeerCertAdapter on Req.Services.
+/// so every request carrying a peer certificate publishes a
+/// TCrossSocketPeerCertAdapter through PublishPeerCert.
 ///
 /// SCAFFOLD: currently a no-op stub. The real implementation registers a
 /// callback on TCrossSocketBridge's per-request setup.
@@ -126,8 +127,8 @@ end;
 procedure RegisterCrossSocketPeerCertAdapter;
 begin
   // TODO: hook into horse-provider-crosssocket. The provider's request
-  // bridge publishes TCrossSocketPeerCertAdapter on Req.Services for every
-  // request whose connection carries a verified peer cert. See
+  // bridge calls PublishPeerCert with a TCrossSocketPeerCertAdapter for
+  // every request whose connection carries a peer cert. See
   // Delphi-Cross-Socket's TCrossConnection for the SSL/TLS handle.
 end;
 

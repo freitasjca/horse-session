@@ -2,14 +2,14 @@
 
 Authentication identity middleware for the [Horse](https://github.com/HashLoad/horse) web framework.
 
-Status: **v0.1.0-alpha.1** — scaffold. See `docs/horse-session-decision.md` in the workspace for the full ADR.
+Status: **alpha**. JWT, API-key and cookie authentication and the authorization checks are implemented and tested; mTLS is not functional yet (see the provider table). See `docs/horse-session-decision.md` in the workspace for the full ADR.
 
 ## What it does
 
 - Extracts a `TPrincipal` (user id, tenant id, roles, scopes, claims) from every HTTP request via a chain of pluggable `IPrincipalResolver` implementations.
-- Writes the principal to `Req.Session[HORSE_SESSION_PRINCIPAL_KEY]`. Downstream middleware (including `horse-ai-conversations`) reads from there.
+- Attaches the principal to the request. Downstream code (including `horse-ai-conversations`) reads it with `PrincipalOf(Req)`.
 - Emits security events through `IAuthAuditSink` with a stable, backward-compatible `TAuthAuditEvent` record shared across the Horse ecosystem.
-- Ships basic role / scope authorization helpers (`THorseAuthorize.RequireRole`, `.RequireScope`, `.RequireAuthenticated`).
+- Ships basic role / scope authorization checks (`THorseAuthorize`, see Authorization below).
 
 ## Not in v1
 
@@ -31,7 +31,7 @@ boss install github.com/freitasjca/horse-session
 uses
   System.SysUtils,
   Horse,
-  Horse.Session,
+  Horse.Session.Middleware,
   Horse.Session.Types,
   Horse.Session.Jwt,
   Horse.Session.ApiKey,
@@ -39,31 +39,55 @@ uses
 
 var
   LConfig: THorseSessionConfig;
-  LJwtSecret: string;
+  LKeys: TMemoryApiKeyStore;
+  LKey: TApiKeyRecord;
 begin
-  LJwtSecret := GetEnvironmentVariable('JWT_SECRET');
+  LKeys := TMemoryApiKeyStore.Create;
+  LKey := Default(TApiKeyRecord);
+  LKey.UserId := 'svc-reports';
+  LKey.TenantId := 'acme';
+  LKeys.Add(GetEnvironmentVariable('REPORTS_API_KEY'), LKey);
+
   LConfig := THorseSessionConfig.Default;
   LConfig.Resolvers := [
-    TJwtHS256Resolver.New(LJwtSecret), // at least 32 bytes, from your secret store
-    TApiKeyResolver.New(TApiKeyMap.Create(['alice-key', 'bob-key']))
+    // the secret must be at least 32 bytes
+    TJwtHS256Resolver.New(GetEnvironmentVariable('JWT_SECRET')),
+    TApiKeyResolver.New(LKeys)
   ];
 
   THorse.Use(THorseSession.New(LConfig));
-  THorse.Use(THorseAuthorize.RequireAuthenticated);
+  THorse.Use(THorseAuthorize.RequireAuthenticated());
 
   THorse.Get('/admin',
-    THorseAuthorize.RequireRole('admin'),
     procedure(Req: THorseRequest; Res: THorseResponse)
-    var
-      LPrincipal: TPrincipal;
     begin
-      LPrincipal := TPrincipal(Req.Session[HORSE_SESSION_PRINCIPAL_KEY]);
-      Res.Send('Hello, ' + LPrincipal.UserId);
+      THorseAuthorize.DemandRole(Req, Res, 'admin');
+      Res.Send('Hello, ' + PrincipalOf(Req).UserId);
     end);
 
   THorse.Listen(9000);
 end.
 ```
+
+The main unit is `Horse.Session.Middleware`, not `Horse.Session`: Horse itself already has a unit with that name.
+
+## Reading the principal
+
+The middleware attaches a `TPrincipal` to every request, authenticated or anonymous. Read it with `PrincipalOf(Req)` or `TryGetPrincipal(Req, LPrincipal)` from `Horse.Session.Types`. The request owns the principal and Horse frees it when the request ends, so never free it yourself.
+
+## Authorization
+
+| Call | Where | Refusal |
+|------|-------|---------|
+| `THorseAuthorize.RequireAuthenticated()` (keep the parentheses) | middleware, Delphi and FPC | 401 |
+| `THorseAuthorize.DemandAuthenticated(Req, Res)` | inside a handler, Delphi and FPC | 401 |
+| `THorseAuthorize.DemandRole(Req, Res, 'admin')` | inside a handler, Delphi and FPC | 401, or 403 without the role |
+| `THorseAuthorize.DemandScope(Req, Res, 'write')` | inside a handler, Delphi and FPC | 401, or 403 without the scope |
+| `THorseAuthorize.RequireRole('admin')` / `RequireScope('write')` | middleware, **Delphi only** | 401 / 403 |
+
+`RequireRole` and `RequireScope` have to remember their argument for each route, which needs a closure. On FPC a Horse callback is a plain procedure and cannot hold one, so use `DemandRole` / `DemandScope` at the top of the handler there. A `Demand*` call that refuses sends the status and stops the handler.
+
+Every refusal is audited as `authorization.denied` with reason `not-authenticated`, `missing-role` or `missing-scope`.
 
 ## JWT (HS256)
 
@@ -104,12 +128,14 @@ Hard constraints: audit records **never** contain credentials (keys, JWTs, cooki
 
 | Provider      | HTTP auth | mTLS |
 |---------------|-----------|------|
-| CrossSocket   | ✓         | ✓ (via `Horse.Session.CrossSocket`) |
+| CrossSocket   | ✓         | not yet: the contract and `TMTLSResolver` exist, the hook in the provider does not |
 | nghttp2       | ✓         | — (ships with provider repo in later release) |
 | mORMot        | ✓         | — |
 | ICS           | ✓         | — |
 | Indy          | ✓         | — |
 | Apache / ISAPI / CGI | ✓  | n/a (upstream handles it) |
+
+The HTTP auth column is by design: the package only uses Horse's request API, which every provider fills in. It is tested in-process (see `tests/`), not yet against a live server on each provider.
 
 ## See also
 

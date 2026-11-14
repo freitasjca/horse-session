@@ -6,10 +6,17 @@ unit Horse.Session.Types;
 //  horse-session -- shared data types and ecosystem constants
 //  -----------------------------------------------------------------------------
 //  TPrincipal is the identity contract every resolver populates and every
-//  downstream consumer reads. The HORSE_SESSION_PRINCIPAL_KEY constant is the
-//  well-known Req.Session key under which the principal is attached -- sibling
-//  packages (horse-ai-conversations in v1, future consumers) import this
-//  constant rather than redeclaring the string literal.
+//  downstream consumer reads.
+//
+//  Where the principal lives: TPrincipal descends from Horse's TSession and
+//  is stored in Req.Sessions under its own class (SetPrincipal). Horse owns
+//  whatever is stored there and frees it when the request ends, so nobody
+//  frees a principal obtained from a request. Sibling packages read it with
+//  PrincipalOf / TryGetPrincipal, never through Req.Sessions directly.
+//
+//  Unit naming: Horse core already has a unit called Horse.Session (it
+//  declares TSession). This package's units are all Horse.Session.<Name>;
+//  the middleware is Horse.Session.Middleware.
 //
 //  Dual-compile notes (every unit compiles on Delphi 10.4+ and FPC 3.2.2+):
 //    - Plain record with class-method Default factory, no generics in the
@@ -24,17 +31,13 @@ interface
 uses
 {$IF DEFINED(FPC)}
   SysUtils,
-  Generics.Collections;
+  Generics.Collections,
 {$ELSE}
   System.SysUtils,
-  System.Generics.Collections;
+  System.Generics.Collections,
 {$IFEND}
-
-const
-  /// Well-known Req.Session key under which horse-session writes the
-  /// authenticated principal. Sibling packages (horse-ai-conversations,
-  /// future audit consumers) import this constant, not a local literal.
-  HORSE_SESSION_PRINCIPAL_KEY = 'horse-session.principal';
+  Horse.Session,   // Horse core: TSession, THorseSessions
+  Horse.Request;
 
 type
   /// Claims bag -- opaque, string-to-string, extension point for anything
@@ -43,7 +46,7 @@ type
 
   /// Authenticated principal. Immutable after the resolver chain completes:
   /// downstream middleware reads but never mutates it.
-  TPrincipal = class
+  TPrincipal = class(TSession)
   strict private
     FUserId: string;
     FTenantId: string;
@@ -89,7 +92,38 @@ type
   /// Never raised while a request is being resolved.
   EHorseSessionConfig = class(Exception);
 
+/// Attaches APrincipal to the request. The request takes ownership: Horse
+/// frees it at request end, and a principal already attached is freed and
+/// replaced. Do not free APrincipal after this call.
+procedure SetPrincipal(const AReq: THorseRequest; const APrincipal: TPrincipal);
+/// The principal attached to the request, or nil when the horse-session
+/// middleware has not run. The request owns it: never free the result.
+function PrincipalOf(const AReq: THorseRequest): TPrincipal;
+/// True when a principal is attached (authenticated or anonymous).
+function TryGetPrincipal(const AReq: THorseRequest;
+                         out APrincipal: TPrincipal): Boolean;
+
 implementation
+
+procedure SetPrincipal(const AReq: THorseRequest; const APrincipal: TPrincipal);
+begin
+  AReq.Sessions.SetSession(TPrincipal, APrincipal);
+end;
+
+function PrincipalOf(const AReq: THorseRequest): TPrincipal;
+begin
+  if AReq.Sessions.Contains(TPrincipal) then
+    Result := TPrincipal(AReq.Sessions.Session[TPrincipal])
+  else
+    Result := nil;
+end;
+
+function TryGetPrincipal(const AReq: THorseRequest;
+                         out APrincipal: TPrincipal): Boolean;
+begin
+  APrincipal := PrincipalOf(AReq);
+  Result := APrincipal <> nil;
+end;
 
 { TPrincipal }
 

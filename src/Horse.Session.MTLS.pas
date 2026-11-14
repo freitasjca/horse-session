@@ -7,8 +7,9 @@ unit Horse.Session.MTLS;
 //  -----------------------------------------------------------------------------
 //  Horse core does not expose peer-certificate information uniformly across
 //  providers; each provider that supports mTLS must publish IHorseTLSPeerCert
-//  on the request. This unit defines the extension interface (provider-
-//  agnostic) and the resolver that consumes it. The CrossSocket implementation
+//  on the request with PublishPeerCert (it is stored in Req.Sessions, which
+//  every Horse version has). This unit defines the extension interface
+//  (provider-agnostic) and the resolver that consumes it. The CrossSocket implementation
 //  of the extension lives in Horse.Session.CrossSocket -- that unit is opt-in
 //  (users add it to their uses clause to activate mTLS on CrossSocket).
 //
@@ -31,13 +32,15 @@ uses
   System.SysUtils,
   System.Classes,
 {$IFEND}
+  Horse.Session,   // Horse core: TSession
   Horse.Request,
   Horse.Session.Types,
   Horse.Session.Resolver;
 
 type
   /// Peer-certificate accessor. Provider-specific units publish this on
-  /// Req.Services so the mTLS resolver can read it provider-agnostically.
+  /// the request (PublishPeerCert) so the mTLS resolver can read it
+  /// provider-agnostically.
   ///
   /// IsVerified MUST reflect the TLS stack's own verification result --
   /// never return True for a cert that failed trust-chain validation.
@@ -52,6 +55,16 @@ type
     function SubjectDN: string;        // full RFC 4514 DN string
     function SubjectAltNames: TArray<string>;   // DNS: / URI: / email: entries
     function SerialHex: string;
+  end;
+
+  /// Holder stored in Req.Sessions under its own class. The request owns
+  /// the holder; the holder keeps the accessor alive by interface reference.
+  THorseTLSPeerCertSlot = class(TSession)
+  strict private
+    FPeer: IHorseTLSPeerCert;
+  public
+    constructor Create(const APeer: IHorseTLSPeerCert);
+    property Peer: IHorseTLSPeerCert read FPeer;
   end;
 
   /// Optional pluggable mapper from subject -> (UserId, TenantId, Roles).
@@ -84,7 +97,36 @@ type
     class function New(const AMapper: ICertSubjectMapper): IPrincipalResolver; overload;
   end;
 
+/// Called by a provider adapter, once per request, for a connection that
+/// presented a client certificate. Passing nil publishes nothing.
+procedure PublishPeerCert(const AReq: THorseRequest; const APeer: IHorseTLSPeerCert);
+/// The accessor published on the request, or nil.
+function PeerCertOf(const AReq: THorseRequest): IHorseTLSPeerCert;
+
 implementation
+
+procedure PublishPeerCert(const AReq: THorseRequest; const APeer: IHorseTLSPeerCert);
+begin
+  if APeer <> nil then
+    AReq.Sessions.SetSession(THorseTLSPeerCertSlot,
+                             THorseTLSPeerCertSlot.Create(APeer));
+end;
+
+function PeerCertOf(const AReq: THorseRequest): IHorseTLSPeerCert;
+begin
+  if AReq.Sessions.Contains(THorseTLSPeerCertSlot) then
+    Result := THorseTLSPeerCertSlot(AReq.Sessions.Session[THorseTLSPeerCertSlot]).Peer
+  else
+    Result := nil;
+end;
+
+{ THorseTLSPeerCertSlot }
+
+constructor THorseTLSPeerCertSlot.Create(const APeer: IHorseTLSPeerCert);
+begin
+  inherited Create;
+  FPeer := APeer;
+end;
 
 { TDefaultCertSubjectMapper }
 
@@ -129,7 +171,6 @@ function TMTLSResolver.TryResolve(const AReq: THorseRequest;
                                   out AReason: string): Boolean;
 var
   LPeer: IHorseTLSPeerCert;
-  LRaw: TObject;
   LUserId, LTenantId: string;
   LRoles, LScopes: TArray<string>;
 begin
@@ -137,17 +178,11 @@ begin
   AReason := '';
   Result := False;
 
-  // The extension is published on Req.Services by the provider adapter.
-  // A provider that doesn't support mTLS doesn't publish it -> we fall
-  // through silently (Reason='') to the next resolver.
-  try
-    LRaw := AReq.Services.Resolve(TObject);  // scaffold: provider adapter
-                                             // will register under its own
-                                             // TClass key
-  except
-    LRaw := nil;
-  end;
-  if (LRaw = nil) or not Supports(LRaw, IHorseTLSPeerCert, LPeer) then
+  // The provider adapter publishes the accessor with PublishPeerCert. A
+  // provider without mTLS, or a connection without a client certificate,
+  // publishes nothing -> fall through silently (Reason='').
+  LPeer := PeerCertOf(AReq);
+  if LPeer = nil then
     Exit;
 
   // The provider HAS surfaced a peer cert slot. From here, every failure

@@ -1,6 +1,6 @@
 {
   "name": "horse-session",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Authentication identity middleware for Horse: TPrincipal + pluggable IPrincipalResolver resolvers (JWT HS256, API key, cookie, mTLS extension), stable IAuthAuditSink + TAuthAuditEvent shared across the Horse ecosystem, basic role/scope authorization. HTTP only in v1.",
   "mainsrc": "src/",
   "browsingpath": "src/",

@@ -1,4 +1,4 @@
-unit Horse.Session;
+unit Horse.Session.Middleware;
 
 {$IF DEFINED(FPC)}{$MODE DELPHI}{$H+}{$ENDIF}
 
@@ -6,9 +6,13 @@ unit Horse.Session;
 //  horse-session -- main middleware facade
 //  -----------------------------------------------------------------------------
 //  Runs the configured IPrincipalResolver chain (first success wins) and
-//  writes the resulting TPrincipal to Req.Session[HORSE_SESSION_PRINCIPAL_KEY].
-//  Downstream middleware (THorseAuthorize.Require*) and consumer packages
-//  (horse-ai-conversations) read from that key.
+//  attaches the resulting TPrincipal to the request (SetPrincipal in
+//  Horse.Session.Types). Downstream middleware (THorseAuthorize) and
+//  consumer packages (horse-ai-conversations) read it with PrincipalOf.
+//  The request owns the principal and Horse frees it at request end.
+//
+//  This unit is NOT called Horse.Session: Horse core already has a unit
+//  with that name.
 //
 //  Behaviour:
 //    - On success: write an authenticated TPrincipal, audit as
@@ -26,7 +30,8 @@ unit Horse.Session;
 //    - FailClosed=True: a raising sink aborts the request with 500.
 //
 //  FPC NOTE: same plain-procedure + globals pattern as
-//  horse-request-guard / Horse.Session.Authorize. Process-wide config.
+//  horse-request-guard. The config is process-wide: a second New(AConfig)
+//  replaces the first.
 // =============================================================================
 
 interface
@@ -70,10 +75,12 @@ type
     class function New(const AConfig: THorseSessionConfig): THorseCallback; overload;
   end;
 
-implementation
+/// Sends AEvent to the sink configured through THorseSession.New, honouring
+/// FailClosed. A no-op before the middleware is installed. Used by
+/// Horse.Session.Authorize so authorization decisions reach the same sink.
+procedure HorseSessionAudit(const AEvent: TAuthAuditEvent);
 
-uses
-  Horse.Exception.Interrupted;
+implementation
 
 var
   GConfig: THorseSessionConfig;
@@ -88,9 +95,9 @@ begin
   Result.FailClosed := False;
 end;
 
-procedure EmitAudit(const AEvent: TAuthAuditEvent);
+procedure HorseSessionAudit(const AEvent: TAuthAuditEvent);
 begin
-  if GConfig.AuditSink = nil then
+  if (not GInstalled) or (GConfig.AuditSink = nil) then
     Exit;
   try
     GConfig.AuditSink.RecordEvent(AEvent);
@@ -109,6 +116,7 @@ var
   LRecognised: Boolean;
   LAccepted: Boolean;
   LCorrelationId: string;
+  LResolverName: string;
 begin
   if not GInstalled then
   begin
@@ -121,13 +129,21 @@ begin
   LRecognised := False;
   LAccepted := False;
 
+  LResolverName := '';
+
   for LResolver in GConfig.Resolvers do
   begin
-    if LResolver.TryResolve(AReq, LPrincipal, LReason) then
+    if LResolver = nil then
+      Continue;
+    if LResolver.TryResolve(AReq, LPrincipal, LReason) and
+       (LPrincipal <> nil) and LPrincipal.IsAuthenticated then
     begin
       LAccepted := True;
+      LResolverName := LResolver.Name;
       Break;
     end;
+    // Not accepted: whatever the resolver left behind is never trusted.
+    FreeAndNil(LPrincipal);
     if LReason <> '' then
     begin
       LRecognised := True;
@@ -138,23 +154,18 @@ begin
   if LPrincipal = nil then
     LPrincipal := TPrincipal.CreateAnonymous;
 
-  AReq.Session.AddOrSetValue(HORSE_SESSION_PRINCIPAL_KEY, LPrincipal);
-  // Note: TDictionary ownership of TObject values is the caller's concern.
-  // Horse's Req.Session is a TDictionary<string,TObject>; the principal
-  // will leak unless the app or middleware frees it. The horse-session
-  // onResponse hook (TODO in v0.2) will free the principal at request end.
+  // From here the request owns LPrincipal; Horse frees it at request end.
+  SetPrincipal(AReq, LPrincipal);
 
-  // scaffold correlation id -- Horse exposes a request-id header convention
-  // that varies by provider; a real implementation reads X-Request-ID.
   LCorrelationId := AReq.Headers['X-Request-ID'];
 
   if LAccepted then
-    EmitAudit(MakeAuthEvent('authentication.succeeded',
+    HorseSessionAudit(MakeAuthEvent('authentication.succeeded',
                             LPrincipal.TenantId, LPrincipal.UserId,
                             'route', AReq.PathInfo,
-                            'succeeded', LResolver.Name, LCorrelationId))
+                            'succeeded', LResolverName, LCorrelationId))
   else if LRecognised then
-    EmitAudit(MakeAuthEvent('authentication.failed',
+    HorseSessionAudit(MakeAuthEvent('authentication.failed',
                             '', '',
                             'route', AReq.PathInfo,
                             'failed', LReason, LCorrelationId));

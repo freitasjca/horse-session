@@ -23,6 +23,16 @@ program HorseSessionTests;
       exp / nbf / iss / aud / sub checks, malformed input, short secret.
     - TCookieResolver: Cookie header parsing, PackSessionId against an
       independently computed value, tampering, unknown session.
+    - THorseSession middleware, THorseAuthorize and TMTLSResolver, driven
+      in-process through real THorseRequest / THorseResponse objects.
+
+  Every unit of the package is in the uses clause on purpose: a unit that
+  no test names is a unit nobody has compiled.
+
+  The middleware tests build requests with THorseRequest.Create(nil) and
+  fill Req.Headers directly. That needs a Horse whose request tolerates a
+  nil web request (the freitasjca fork does); it is a test-only dependency,
+  the package sources themselves compile against upstream Horse.
 
   No DUnitX: plain Writeln + a failure counter + non-zero exit. Matches
   horse-ai/tests/HorseAITests.dpr style.
@@ -42,7 +52,17 @@ uses
   Horse.Session.ApiKey,
   Horse.Session.Cookie,
   Horse.Session.Crypto,
-  Horse.Session.Jwt;
+  Horse.Session.Jwt,
+  Horse.Session.Resolver,
+  Horse.Session.MTLS,
+  Horse.Session.CrossSocket,
+  Horse.Session.Middleware,
+  Horse.Session.Authorize,
+  Horse.Request,
+  Horse.Response,
+  Horse.Callback,
+  Horse.Proc,
+  Horse.Exception.Interrupted;
 
 var
   GTotal: Integer = 0;
@@ -622,6 +642,482 @@ begin
   AssertTrue('short signing key raises EHorseSessionConfig', LRaised);
 end;
 
+{ --- THorseSession middleware / THorseAuthorize / TMTLSResolver --------- }
+
+type
+  /// Stands in for the rest of the Horse pipeline: counts Next calls.
+  TNextCounter = class
+  public
+    Count: Integer;
+    procedure Call;
+  end;
+
+  /// Resolver that returns False but leaves a principal behind, to prove
+  /// the middleware never trusts one from a resolver that did not accept.
+  TLeakyResolver = class(TInterfacedObject, IPrincipalResolver)
+  public
+    function TryResolve(const AReq: THorseRequest;
+                       out APrincipal: TPrincipal;
+                       out AReason: string): Boolean;
+    function Name: string;
+  end;
+
+procedure TNextCounter.Call;
+begin
+  Inc(Count);
+end;
+
+function TLeakyResolver.TryResolve(const AReq: THorseRequest;
+                                   out APrincipal: TPrincipal;
+                                   out AReason: string): Boolean;
+begin
+  APrincipal := TPrincipal.Create('mallory', 'evil', nil, nil, nil, True);
+  AReason := '';
+  Result := False;
+end;
+
+function TLeakyResolver.Name: string;
+begin
+  Result := 'leaky';
+end;
+
+procedure InvokeCallback(const ACallback: THorseCallback; const AReq: THorseRequest;
+                         const ARes: THorseResponse; const ACounter: TNextCounter);
+{$IF DEFINED(FPC)}
+var
+  LProc: THorseCallbackProc;
+begin
+  LProc := ACallback;
+  LProc(AReq, ARes, ACounter.Call);
+end;
+{$ELSE}
+begin
+  ACallback(AReq, ARes, ACounter.Call);
+end;
+{$IFEND}
+
+/// Runs ACallback and reports whether it interrupted the pipeline.
+function Interrupted(const ACallback: THorseCallback; const AReq: THorseRequest;
+                     const ARes: THorseResponse; const ACounter: TNextCounter): Boolean;
+begin
+  Result := False;
+  try
+    InvokeCallback(ACallback, AReq, ARes, ACounter);
+  except
+    on E: EHorseCallbackInterrupted do
+      Result := True;
+  end;
+end;
+
+function NewRequest(const AHeaderName, AHeaderValue: string): THorseRequest;
+begin
+  Result := THorseRequest.Create(nil);
+  if AHeaderName <> '' then
+    Result.Headers.Dictionary.AddOrSetValue(AHeaderName, AHeaderValue);
+end;
+
+function LastAction(const ASink: TMemoryAuthAuditSink): string;
+var
+  LEvents: TArray<TAuthAuditEvent>;
+begin
+  LEvents := ASink.Snapshot;
+  if Length(LEvents) = 0 then
+    Result := '(none)'
+  else
+    Result := LEvents[High(LEvents)].Action + '/' + LEvents[High(LEvents)].Reason;
+end;
+
+procedure TestMiddleware;
+var
+  LConfig: THorseSessionConfig;
+  LSink: TMemoryAuthAuditSink;
+  LSinkRef: IAuthAuditSink;
+  LKeys: TMemoryApiKeyStore;
+  LKeysRef: IApiKeyStore;
+  LSessions: ISessionStore;
+  LKeyRec: TApiKeyRecord;
+  LSessRec: TSessionRecord;
+  LCallback: THorseCallback;
+  LReq: THorseRequest;
+  LRes: THorseResponse;
+  LNext: TNextCounter;
+  LPrincipal: TPrincipal;
+begin
+  Writeln;
+  Writeln('-- THorseSession middleware --');
+
+  LSink := TMemoryAuthAuditSink.Create;
+  LSinkRef := LSink;
+
+  LKeys := TMemoryApiKeyStore.Create;
+  LKeysRef := LKeys;
+  LKeyRec := Default(TApiKeyRecord);
+  LKeyRec.UserId := 'svc-reports';
+  LKeyRec.TenantId := 'acme';
+  LKeys.Add('key-123', LKeyRec);
+
+  LSessions := TMemorySessionStore.Create;
+  LSessRec := Default(TSessionRecord);
+  LSessRec.SessionId := 'sess-1';
+  LSessRec.UserId := 'carol';
+  LSessRec.TenantId := 'acme';
+  LSessions.Upsert(LSessRec);
+
+  LConfig := THorseSessionConfig.Default;
+  LConfig.AuditSink := LSinkRef;
+  SetLength(LConfig.Resolvers, 4);
+  LConfig.Resolvers[0] := TLeakyResolver.Create;
+  LConfig.Resolvers[1] := TJwtHS256Resolver.New(TEST_KEY);
+  LConfig.Resolvers[2] := TApiKeyResolver.New(LKeysRef);
+  LConfig.Resolvers[3] := TCookieResolver.New(LSessions, TEST_KEY);
+  LCallback := THorseSession.New(LConfig);
+
+  LNext := TNextCounter.Create;
+  LRes := THorseResponse.Create(nil);
+  try
+    // No credentials at all.
+    LSink.Clear;
+    LReq := NewRequest('', '');
+    try
+      AssertTrue('no principal before the middleware runs', PrincipalOf(LReq) = nil);
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      AssertEqualInt('no credentials: Next called', 1, LNext.Count);
+      LPrincipal := PrincipalOf(LReq);
+      AssertTrue('no credentials: anonymous principal attached',
+        (LPrincipal <> nil) and not LPrincipal.IsAuthenticated);
+      AssertTrue('no credentials: leaked principal not trusted',
+        (LPrincipal <> nil) and (LPrincipal.UserId = ''));
+      AssertEqualStr('no credentials: no audit event', '(none)', LastAction(LSink));
+    finally
+      LReq.Free;
+    end;
+
+    // Valid bearer token.
+    LSink.Clear;
+    LReq := NewRequest('Authorization', 'Bearer ' + REFERENCE_TOKEN);
+    try
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      AssertEqualInt('JWT: Next called', 2, LNext.Count);
+      AssertTrue('JWT: TryGetPrincipal', TryGetPrincipal(LReq, LPrincipal));
+      AssertTrue('JWT: authenticated as alice',
+        (LPrincipal <> nil) and LPrincipal.IsAuthenticated and
+        (LPrincipal.UserId = 'alice') and (LPrincipal.TenantId = 'acme'));
+      AssertEqualStr('JWT: audit', 'authentication.succeeded/jwt-hs256',
+        LastAction(LSink));
+    finally
+      LReq.Free;
+    end;
+
+    // Scheme is case-insensitive.
+    LReq := NewRequest('Authorization', 'bearer ' + REFERENCE_TOKEN);
+    try
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      AssertTrue('JWT: lower-case "bearer" accepted',
+        (PrincipalOf(LReq) <> nil) and PrincipalOf(LReq).IsAuthenticated);
+    finally
+      LReq.Free;
+    end;
+
+    // Bad token: recognised and rejected. The chain stops, so the valid
+    // API key on the same request must NOT rescue it.
+    LSink.Clear;
+    LReq := NewRequest('Authorization', 'Bearer not.a.token');
+    try
+      LReq.Headers.Dictionary.AddOrSetValue('X-API-Key', 'key-123');
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      LPrincipal := PrincipalOf(LReq);
+      AssertTrue('bad JWT: anonymous even with a valid API key',
+        (LPrincipal <> nil) and not LPrincipal.IsAuthenticated);
+      AssertEqualStr('bad JWT: audit', 'authentication.failed/malformed-token',
+        LastAction(LSink));
+    finally
+      LReq.Free;
+    end;
+
+    // Another Authorization scheme falls through to the API key.
+    LSink.Clear;
+    LReq := NewRequest('Authorization', 'Basic dXNlcjpwYXNz');
+    try
+      LReq.Headers.Dictionary.AddOrSetValue('X-API-Key', 'key-123');
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      LPrincipal := PrincipalOf(LReq);
+      AssertTrue('Basic + API key: authenticated by the API key',
+        (LPrincipal <> nil) and LPrincipal.IsAuthenticated and
+        (LPrincipal.UserId = 'svc-reports'));
+      AssertEqualStr('API key: audit', 'authentication.succeeded/api-key',
+        LastAction(LSink));
+    finally
+      LReq.Free;
+    end;
+
+    // Wrong API key.
+    LSink.Clear;
+    LReq := NewRequest('X-API-Key', 'key-999');
+    try
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      AssertTrue('wrong API key: anonymous',
+        (PrincipalOf(LReq) <> nil) and not PrincipalOf(LReq).IsAuthenticated);
+      AssertEqualStr('wrong API key: audit', 'authentication.failed/invalid-api-key',
+        LastAction(LSink));
+    finally
+      LReq.Free;
+    end;
+
+    // Session cookie among other cookies.
+    LSink.Clear;
+    LReq := NewRequest('Cookie',
+      'theme=dark; horse_session=' + TCookieResolver.PackSessionId('sess-1', TEST_KEY));
+    try
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      LPrincipal := PrincipalOf(LReq);
+      AssertTrue('cookie: authenticated as carol',
+        (LPrincipal <> nil) and LPrincipal.IsAuthenticated and
+        (LPrincipal.UserId = 'carol'));
+      AssertEqualStr('cookie: audit', 'authentication.succeeded/cookie',
+        LastAction(LSink));
+    finally
+      LReq.Free;
+    end;
+
+    // Forged cookie.
+    LSink.Clear;
+    LReq := NewRequest('Cookie',
+      'horse_session=' + TCookieResolver.PackSessionId('sess-1', OTHER_KEY));
+    try
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      AssertTrue('forged cookie: anonymous',
+        (PrincipalOf(LReq) <> nil) and not PrincipalOf(LReq).IsAuthenticated);
+      AssertEqualStr('forged cookie: audit',
+        'authentication.failed/invalid-cookie-signature', LastAction(LSink));
+    finally
+      LReq.Free;
+    end;
+
+    // Running the middleware twice on one request replaces the principal
+    // (and must not leak or double-free the first one).
+    LReq := NewRequest('X-API-Key', 'key-123');
+    try
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      InvokeCallback(LCallback, LReq, LRes, LNext);
+      AssertTrue('middleware run twice: principal still valid',
+        (PrincipalOf(LReq) <> nil) and (PrincipalOf(LReq).UserId = 'svc-reports'));
+    finally
+      LReq.Free;
+    end;
+  finally
+    LRes.Free;
+    LNext.Free;
+  end;
+end;
+
+procedure TestAuthorize;
+var
+  LConfig: THorseSessionConfig;
+  LSink: TMemoryAuthAuditSink;
+  LSinkRef: IAuthAuditSink;
+  LSession, LRequireAuth: THorseCallback;
+{$IF NOT DEFINED(FPC)}
+  LRequireAdmin, LRequireRoot, LRequireRead, LRequireDelete: THorseCallback;
+{$IFEND}
+  LReq: THorseRequest;
+  LRes: THorseResponse;
+  LNext: TNextCounter;
+  LStopped: Boolean;
+begin
+  Writeln;
+  Writeln('-- THorseAuthorize --');
+
+  LSink := TMemoryAuthAuditSink.Create;
+  LSinkRef := LSink;
+  LConfig := THorseSessionConfig.Default;
+  LConfig.AuditSink := LSinkRef;
+  SetLength(LConfig.Resolvers, 1);
+  LConfig.Resolvers[0] := TJwtHS256Resolver.New(TEST_KEY);
+  LSession := THorseSession.New(LConfig);
+  // The parentheses matter on Delphi: without them the compiler takes the
+  // address of the class function instead of calling it (E2010).
+  LRequireAuth := THorseAuthorize.RequireAuthenticated();
+
+  LNext := TNextCounter.Create;
+  try
+    // Request the session middleware never saw.
+    LReq := NewRequest('', '');
+    LRes := THorseResponse.Create(nil);
+    try
+      AssertTrue('no middleware: RequireAuthenticated interrupts',
+        Interrupted(LRequireAuth, LReq, LRes, LNext));
+      AssertEqualInt('no middleware: 401', 401, LRes.Status);
+      AssertEqualInt('no middleware: Next not called', 0, LNext.Count);
+    finally
+      LRes.Free;
+      LReq.Free;
+    end;
+
+    // Anonymous request.
+    LSink.Clear;
+    LReq := NewRequest('', '');
+    LRes := THorseResponse.Create(nil);
+    try
+      InvokeCallback(LSession, LReq, LRes, LNext);
+      LNext.Count := 0;
+      AssertTrue('anonymous: RequireAuthenticated interrupts',
+        Interrupted(LRequireAuth, LReq, LRes, LNext));
+      AssertEqualInt('anonymous: 401', 401, LRes.Status);
+      AssertEqualInt('anonymous: Next not called', 0, LNext.Count);
+      AssertEqualStr('anonymous: audit', 'authorization.denied/not-authenticated',
+        LastAction(LSink));
+
+      LStopped := False;
+      try
+        THorseAuthorize.DemandRole(LReq, LRes, 'admin');
+      except
+        on E: EHorseCallbackInterrupted do
+          LStopped := True;
+      end;
+      AssertTrue('anonymous: DemandRole interrupts', LStopped);
+      AssertEqualInt('anonymous: DemandRole answers 401, not 403', 401, LRes.Status);
+    finally
+      LRes.Free;
+      LReq.Free;
+    end;
+
+    // alice: roles admin + user, scopes read + write.
+    LReq := NewRequest('Authorization', 'Bearer ' + REFERENCE_TOKEN);
+    LRes := THorseResponse.Create(nil);
+    try
+      InvokeCallback(LSession, LReq, LRes, LNext);
+      LNext.Count := 0;
+
+      AssertFalse('alice: RequireAuthenticated passes',
+        Interrupted(LRequireAuth, LReq, LRes, LNext));
+      AssertEqualInt('alice: Next called', 1, LNext.Count);
+
+      LStopped := False;
+      try
+        THorseAuthorize.DemandAuthenticated(LReq, LRes);
+        THorseAuthorize.DemandRole(LReq, LRes, 'admin');
+        THorseAuthorize.DemandRole(LReq, LRes, 'ADMIN');
+        THorseAuthorize.DemandScope(LReq, LRes, 'write');
+      except
+        on E: EHorseCallbackInterrupted do
+          LStopped := True;
+      end;
+      AssertFalse('alice: Demand admin / write pass', LStopped);
+
+      LSink.Clear;
+      LStopped := False;
+      try
+        THorseAuthorize.DemandRole(LReq, LRes, 'root');
+      except
+        on E: EHorseCallbackInterrupted do
+          LStopped := True;
+      end;
+      AssertTrue('alice: DemandRole(root) interrupts', LStopped);
+      AssertEqualInt('alice: DemandRole(root) 403', 403, LRes.Status);
+      AssertEqualStr('alice: missing-role audit', 'authorization.denied/missing-role',
+        LastAction(LSink));
+
+      LStopped := False;
+      try
+        THorseAuthorize.DemandScope(LReq, LRes, 'delete');
+      except
+        on E: EHorseCallbackInterrupted do
+          LStopped := True;
+      end;
+      AssertTrue('alice: DemandScope(delete) interrupts', LStopped);
+      AssertEqualStr('alice: missing-scope audit', 'authorization.denied/missing-scope',
+        LastAction(LSink));
+
+      LStopped := False;
+      try
+        THorseAuthorize.DemandRole(LReq, LRes, '');
+      except
+        on E: EHorseCallbackInterrupted do
+          LStopped := True;
+      end;
+      AssertTrue('alice: empty role requirement refuses', LStopped);
+
+{$IF NOT DEFINED(FPC)}
+      // Create every callback BEFORE invoking any: each must keep its own
+      // requirement. A shared "required role" would make the last one win.
+      LRequireAdmin := THorseAuthorize.RequireRole('admin');
+      LRequireRoot := THorseAuthorize.RequireRole('root');
+      LRequireRead := THorseAuthorize.RequireScope('read');
+      LRequireDelete := THorseAuthorize.RequireScope('delete');
+      LNext.Count := 0;
+      AssertFalse('RequireRole(admin) passes',
+        Interrupted(LRequireAdmin, LReq, LRes, LNext));
+      AssertTrue('RequireRole(root) interrupts',
+        Interrupted(LRequireRoot, LReq, LRes, LNext));
+      AssertFalse('RequireScope(read) passes',
+        Interrupted(LRequireRead, LReq, LRes, LNext));
+      AssertTrue('RequireScope(delete) interrupts',
+        Interrupted(LRequireDelete, LReq, LRes, LNext));
+      AssertFalse('RequireRole(admin) still passes afterwards',
+        Interrupted(LRequireAdmin, LReq, LRes, LNext));
+      AssertEqualInt('Require*: Next called for the three passes', 3, LNext.Count);
+{$IFEND}
+    finally
+      LRes.Free;
+      LReq.Free;
+    end;
+  finally
+    LNext.Free;
+  end;
+end;
+
+// APeer is deliberately not const: the callers pass a freshly created
+// object, and a const interface parameter would not take a reference.
+procedure ExpectMTLS(const AWhat: string; const AResolver: IPrincipalResolver;
+                     APeer: IHorseTLSPeerCert;
+                     const AExpectedUser, AExpectedReason: string);
+var
+  LReq: THorseRequest;
+  LPrincipal: TPrincipal;
+  LReason, LUser: string;
+  LAccepted: Boolean;
+begin
+  LReq := THorseRequest.Create(nil);
+  try
+    PublishPeerCert(LReq, APeer);
+    LAccepted := AResolver.TryResolve(LReq, LPrincipal, LReason);
+    try
+      LUser := '';
+      if LPrincipal <> nil then
+        LUser := LPrincipal.UserId;
+      if AExpectedUser <> '' then
+        AssertTrue(AWhat, LAccepted and (LUser = AExpectedUser))
+      else
+        AssertTrue(AWhat, (not LAccepted) and (LPrincipal = nil) and
+                          (LReason = AExpectedReason));
+    finally
+      LPrincipal.Free;
+    end;
+  finally
+    LReq.Free;
+  end;
+end;
+
+procedure TestMTLS;
+var
+  LResolver: IPrincipalResolver;
+begin
+  Writeln;
+  Writeln('-- TMTLSResolver --');
+
+  LResolver := TMTLSResolver.New;
+  ExpectMTLS('no certificate published: falls through', LResolver, nil, '', '');
+  ExpectMTLS('verified certificate: CN becomes UserId', LResolver,
+    TCrossSocketPeerCertAdapter.Create(True, 'device-42', 'acme',
+      'CN=device-42,O=acme', '0A1B', nil), 'device-42', '');
+  ExpectMTLS('unverified certificate refused', LResolver,
+    TCrossSocketPeerCertAdapter.Create(False, 'device-42', 'acme',
+      'CN=device-42,O=acme', '0A1B', nil), '', 'peer-cert-not-verified');
+  ExpectMTLS('verified certificate without CN refused', LResolver,
+    TCrossSocketPeerCertAdapter.Create(True, '', 'acme', 'O=acme', '0A1B', nil),
+    '', 'peer-cert-no-identity');
+end;
+
 { --- Main -------------------------------------------------------------- }
 
 begin
@@ -636,6 +1132,9 @@ begin
   TestCrypto;
   TestJwt;
   TestCookieResolver;
+  TestMiddleware;
+  TestAuthorize;
+  TestMTLS;
 
   Writeln;
   Writeln(Format('summary: %d total, %d failed', [GTotal, GFailures]));

@@ -31,10 +31,12 @@ interface
 uses
 {$IF DEFINED(FPC)}
   SysUtils,
+  DateUtils,
   Classes,
   SyncObjs;
 {$ELSE}
   System.SysUtils,
+  System.DateUtils,
   System.Classes,
   System.SyncObjs;
 {$IFEND}
@@ -98,7 +100,11 @@ function MakeAuthEvent(const AAction, ATenantId, APrincipalId,
                       AResourceType, AResourceId, AOutcome, AReason,
                       ACorrelationId: string): TAuthAuditEvent;
 begin
-  Result.Timestamp := Now;  // caller-provided TZ discipline; UTC recommended
+{$IF DEFINED(FPC)}
+  Result.Timestamp := LocalTimeToUniversal(Now);
+{$ELSE}
+  Result.Timestamp := TTimeZone.Local.ToUniversalTime(Now);
+{$IFEND}
   Result.TenantId := ATenantId;
   Result.PrincipalId := APrincipalId;
   Result.Action := AAction;
