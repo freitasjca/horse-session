@@ -84,6 +84,11 @@ type
   /// Raised by THorseAuthorize.RequireRole / .RequireScope.
   EHorseSessionForbidden = class(Exception);
 
+  /// Raised at configuration time when a resolver is given unusable
+  /// settings (for example a signing key shorter than the HMAC floor).
+  /// Never raised while a request is being resolved.
+  EHorseSessionConfig = class(Exception);
+
 implementation
 
 { TPrincipal }

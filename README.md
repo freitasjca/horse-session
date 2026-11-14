@@ -29,6 +29,7 @@ boss install github.com/freitasjca/horse-session
 
 ```pascal
 uses
+  System.SysUtils,
   Horse,
   Horse.Session,
   Horse.Session.Types,
@@ -38,10 +39,12 @@ uses
 
 var
   LConfig: THorseSessionConfig;
+  LJwtSecret: string;
 begin
+  LJwtSecret := GetEnvironmentVariable('JWT_SECRET');
   LConfig := THorseSessionConfig.Default;
   LConfig.Resolvers := [
-    TJwtHS256Resolver.New('my-shared-secret'),
+    TJwtHS256Resolver.New(LJwtSecret), // at least 32 bytes, from your secret store
     TApiKeyResolver.New(TApiKeyMap.Create(['alice-key', 'bob-key']))
   ];
 
@@ -61,6 +64,35 @@ begin
   THorse.Listen(9000);
 end.
 ```
+
+## JWT (HS256)
+
+`TJwtHS256Resolver` reads `Authorization: Bearer <token>` and accepts a token only when all of these hold:
+
+- the header `alg` is exactly `HS256` (so `none` and every other algorithm are refused);
+- the HMAC-SHA256 signature matches, compared in constant time, before any claim is read;
+- `exp` is present and in the future, and `nbf` (if present) has passed, each with 30 seconds of leeway by default;
+- `iss` and `aud` match, when you pass an expected issuer or audience to `Create`;
+- `sub` is a non-empty string.
+
+Claim mapping: `sub` → `UserId`, `tenant` (or `tid`) → `TenantId`, `roles` → `Roles`, space-separated `scope` → `Scopes`; every top-level claim is also available through `Claims`.
+
+The secret must be at least 32 bytes (RFC 7518 §3.2). A shorter one raises `EHorseSessionConfig` when the resolver is created. Set `RequireExp := False` only if you really issue tokens that never expire.
+
+## Session cookie
+
+`TCookieResolver` reads the cookie (default name `horse_session`) from the `Cookie` header. The value is `<session-id>.<signature>`, where the signature is HMAC-SHA256 of the id under your signing key (at least 32 bytes). The session itself lives in an `ISessionStore`, so deleting it there revokes it at once.
+
+When you create a session, store the record and send the signed value yourself:
+
+```pascal
+LStore.Upsert(LSessionRecord);
+Res.AddHeader('Set-Cookie',
+  'horse_session=' + TCookieResolver.PackSessionId(LSessionRecord.SessionId, LSigningKey) +
+  '; HttpOnly; Secure; SameSite=Lax; Path=/');
+```
+
+Generate the session id from a cryptographic random source; the package does not generate ids.
 
 ## Audit event schema (ecosystem contract)
 
